@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
-"""
-Pi42 webhook grid bot with SQLite persistence.
+"""Pi42 webhook grid bot -- multi-symbol, SQLite persistence.
 
-Logic:
-1) Fetch latest live price from public klines endpoint (no API key needed).
-2) Keep a descending BUY grid based on `grid_step_pct`.
-3) When live price <= next grid level, place webhook MARKET BUY.
-4) When live price >= last_buy_price * (1 + exit_pct), place webhook MARKET SELL.
-5) Save grid state and all order attempts to SQLite.
+Logic per symbol:
+1) Fetch live price from public klines endpoint (no API key needed).
+2) Descending BUY grid based on grid_step_pct.
+3) live <= next_buy  -> place MARKET BUY, advance grid.
+4) live >= last_buy * (1 + exit_pct) -> place MARKET SELL.
+5) Each symbol runs in its own thread concurrently.
+
+Single symbol  : PI42_SYMBOL=ETHINR
+Multiple symbols: PI42_SYMBOLS=ETHINR,BTCINR,SOLINR
+
+Per-symbol overrides (prefix PI42_<SYMBOL>_):
+  PI42_BTCINR_QTY=0.001
+  PI42_BTCINR_GRID_START_PRICE=8500000
+  PI42_BTCINR_GRID_STEP_PCT=0.5
+  PI42_BTCINR_EXIT_PCT=1.0
+Falls back to global PI42_* default for any unset per-symbol var.
 """
 
 from __future__ import annotations
@@ -15,10 +24,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -27,8 +37,7 @@ PUBLIC_BASE_URL = "https://api.pi42.com"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS grid_state (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    symbol TEXT NOT NULL,
+    symbol TEXT PRIMARY KEY,
     anchor_price REAL NOT NULL,
     next_buy_price REAL NOT NULL,
     last_buy_price REAL,
@@ -82,82 +91,126 @@ def load_env_file(path: str = ".env") -> None:
                 os.environ[key] = value
 
 
+def _genv(key: str, default: str = "") -> str:
+    return os.getenv(key, default)
+
+
 @dataclass
-class GridConfig:
-    webhook_url: Optional[str] = os.getenv("PI42_WEBHOOK_URL", "https://webhooks.pi42.com/9420b64e63e7494c")
-    webhook_uuid: Optional[str] = os.getenv("PI42_WEBHOOK_UUID", "c2796a87be4300c32ea9a527c65f6233429da8ab1a2d1ea1373bc005ae1f5f39")
-    webhook_action: str = os.getenv("PI42_WEBHOOK_ACTION", "NEW_ORDER")
+class SymbolConfig:
+    """Per-symbol trading parameters."""
+    symbol: str
+    quantity: float
+    margin_asset: str
+    grid_start_price: float   # 0 -> auto-use live price on first init
+    grid_step_pct: float
+    exit_pct: float
+    price_decimals: int
+    kline_interval: str
+    kline_limit: int
+    kline_price_type: str
 
-    symbol: str = os.getenv("PI42_SYMBOL", "ETHINR")
-    quantity: float = float(os.getenv("PI42_QTY", "0.015"))
-    margin_asset: str = os.getenv("PI42_MARGIN_ASSET", "INR")
 
-    # First grid anchor and grid spacing
-    grid_start_price: float = float(os.getenv("PI42_GRID_START_PRICE", "185010"))
-    grid_step_pct: float = float(os.getenv("PI42_GRID_STEP_PCT", "1.0"))
-    exit_pct: float = float(os.getenv("PI42_EXIT_PCT", "1.0"))
-    price_decimals: int = int(os.getenv("PI42_PRICE_DECIMALS", "0"))
-
-    kline_interval: str = os.getenv("PI42_KLINE_INTERVAL", "1m")
-    kline_limit: int = int(os.getenv("PI42_KLINE_LIMIT", "2"))
-    kline_price_type: str = os.getenv("PI42_KLINE_PRICE_TYPE", "MARK_PRICE")
-
-    poll_seconds: int = int(os.getenv("PI42_POLL_SECONDS", "15"))
-    run_mode: str = os.getenv("PI42_RUN_MODE", "forever")
-    dry_run: bool = os.getenv("PI42_DRY_RUN", "false").lower() == "true"
-
-    db_path: str = os.getenv("PI42_GRID_DB", "/tmp/grid_bot.db")
+@dataclass
+class GlobalConfig:
+    """Shared settings applied to all symbols."""
+    webhook_url: str
+    webhook_uuid: str
+    webhook_action: str
+    poll_seconds: int
+    run_mode: str
+    dry_run: bool
+    db_path: str
+    symbols: list
 
     def validate(self) -> None:
         if not self.webhook_url:
             raise ValueError("PI42_WEBHOOK_URL is required")
         if not self.webhook_uuid:
             raise ValueError("PI42_WEBHOOK_UUID is required")
-        if self.quantity <= 0:
-            raise ValueError("PI42_QTY must be > 0")
-        if self.grid_start_price <= 0:
-            raise ValueError("PI42_GRID_START_PRICE must be > 0")
-        if self.grid_step_pct <= 0:
-            raise ValueError("PI42_GRID_STEP_PCT must be > 0")
-        if self.exit_pct <= 0:
-            raise ValueError("PI42_EXIT_PCT must be > 0")
-        if self.price_decimals < 0:
-            raise ValueError("PI42_PRICE_DECIMALS must be >= 0")
         if self.run_mode not in {"once", "forever"}:
             raise ValueError("PI42_RUN_MODE must be once or forever")
+        if not self.symbols:
+            raise ValueError(
+                "No symbols. Set PI42_SYMBOLS=ETHINR,BTCINR or PI42_SYMBOL=ETHINR"
+            )
+
+
+def build_global_config() -> GlobalConfig:
+    symbols_raw = _genv("PI42_SYMBOLS") or _genv("PI42_SYMBOL", "ETHINR")
+    symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+    return GlobalConfig(
+        webhook_url=_genv("PI42_WEBHOOK_URL", "https://webhooks.pi42.com/9420b64e63e7494c"),
+        webhook_uuid=_genv(
+            "PI42_WEBHOOK_UUID",
+            "c2796a87be4300c32ea9a527c65f6233429da8ab1a2d1ea1373bc005ae1f5f39",
+        ),
+        webhook_action=_genv("PI42_WEBHOOK_ACTION", "NEW_ORDER"),
+        poll_seconds=int(_genv("PI42_POLL_SECONDS", "15")),
+        run_mode=_genv("PI42_RUN_MODE", "forever"),
+        dry_run=_genv("PI42_DRY_RUN", "false").lower() == "true",
+        db_path=_genv("PI42_GRID_DB", "/tmp/grid_bot.db"),
+        symbols=symbols,
+    )
+
+
+def build_symbol_config(symbol: str) -> SymbolConfig:
+    """Build per-symbol config, falling back to global PI42_* env vars."""
+    s = symbol.upper()
+    prefix = f"PI42_{s}_"
+
+    def get(key: str, default: str) -> str:
+        return os.getenv(f"{prefix}{key}", _genv(f"PI42_{key}", default))
+
+    return SymbolConfig(
+        symbol=s,
+        quantity=float(get("QTY", "0.015")),
+        margin_asset=get("MARGIN_ASSET", "INR"),
+        grid_start_price=float(get("GRID_START_PRICE", "0")),
+        grid_step_pct=float(get("GRID_STEP_PCT", "1.0")),
+        exit_pct=float(get("EXIT_PCT", "1.0")),
+        price_decimals=int(get("PRICE_DECIMALS", "0")),
+        kline_interval=get("KLINE_INTERVAL", "1m"),
+        kline_limit=int(get("KLINE_LIMIT", "2")),
+        kline_price_type=get("KLINE_PRICE_TYPE", "MARK_PRICE"),
+    )
 
 
 class GridStore:
+    """SQLite wrapper. Each bot gets its own connection (WAL multi-writer safe)."""
+
     def __init__(self, db_path: str) -> None:
         db_dir = os.path.dirname(os.path.abspath(db_path))
         os.makedirs(db_dir, exist_ok=True)
-        self.conn = sqlite3.connect(db_path)
-        self.conn.executescript(SCHEMA_SQL)
-        self._migrate_schema()
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self._setup_schema()
         self.conn.commit()
 
-    def _migrate_schema(self) -> None:
+    def _setup_schema(self) -> None:
+        # Migrate old single-row schema (had 'id' column) to symbol-keyed schema
         cols = {
             row[1]
             for row in self.conn.execute("PRAGMA table_info(grid_state)").fetchall()
         }
-        if "last_buy_price" not in cols:
-            self.conn.execute("ALTER TABLE grid_state ADD COLUMN last_buy_price REAL")
+        if "id" in cols:
+            print("[db] migrating old schema -> symbol-keyed schema")
+            self.conn.execute("DROP TABLE grid_state")
+        self.conn.executescript(SCHEMA_SQL)
 
     def close(self) -> None:
         self.conn.close()
 
-    def get_state(self) -> Optional[dict[str, Any]]:
+    def get_state(self, symbol: str) -> Optional[dict[str, Any]]:
         row = self.conn.execute(
             """
-            SELECT symbol, anchor_price, next_buy_price, last_buy_price, step_pct, levels_filled, updated_at
-            FROM grid_state
-            WHERE id = 1
-            """
+            SELECT symbol, anchor_price, next_buy_price, last_buy_price,
+                   step_pct, levels_filled, updated_at
+            FROM grid_state WHERE symbol = ?
+            """,
+            (symbol.upper(),),
         ).fetchone()
         if not row:
             return None
-
         return {
             "symbol": row[0],
             "anchor_price": float(row[1]),
@@ -171,44 +224,37 @@ class GridStore:
     def init_state(self, *, symbol: str, anchor_price: float, step_pct: float) -> None:
         self.conn.execute(
             """
-            INSERT OR REPLACE INTO grid_state (
-                id, symbol, anchor_price, next_buy_price, last_buy_price, step_pct, levels_filled, updated_at
-            ) VALUES (1, ?, ?, ?, NULL, ?, 0, ?)
+            INSERT OR REPLACE INTO grid_state
+                (symbol, anchor_price, next_buy_price, last_buy_price,
+                 step_pct, levels_filled, updated_at)
+            VALUES (?, ?, ?, NULL, ?, 0, ?)
             """,
             (symbol.upper(), anchor_price, anchor_price, step_pct, utc_now_iso()),
         )
         self.conn.commit()
 
-    def advance_level(self, next_buy_price: float) -> None:
+    def advance_level(self, symbol: str, next_buy_price: float) -> None:
         self.conn.execute(
             """
             UPDATE grid_state
             SET next_buy_price = ?, levels_filled = levels_filled + 1, updated_at = ?
-            WHERE id = 1
+            WHERE symbol = ?
             """,
-            (next_buy_price, utc_now_iso()),
+            (next_buy_price, utc_now_iso(), symbol.upper()),
         )
         self.conn.commit()
 
-    def set_last_buy_price(self, last_buy_price: float) -> None:
+    def set_last_buy_price(self, symbol: str, price: float) -> None:
         self.conn.execute(
-            """
-            UPDATE grid_state
-            SET last_buy_price = ?, updated_at = ?
-            WHERE id = 1
-            """,
-            (last_buy_price, utc_now_iso()),
+            "UPDATE grid_state SET last_buy_price = ?, updated_at = ? WHERE symbol = ?",
+            (price, utc_now_iso(), symbol.upper()),
         )
         self.conn.commit()
 
-    def clear_last_buy_price(self) -> None:
+    def clear_last_buy_price(self, symbol: str) -> None:
         self.conn.execute(
-            """
-            UPDATE grid_state
-            SET last_buy_price = NULL, updated_at = ?
-            WHERE id = 1
-            """,
-            (utc_now_iso(),),
+            "UPDATE grid_state SET last_buy_price = NULL, updated_at = ? WHERE symbol = ?",
+            (utc_now_iso(), symbol.upper()),
         )
         self.conn.commit()
 
@@ -246,48 +292,39 @@ class GridStore:
         self.conn.commit()
 
 
-class Pi42PublicWebhookClient:
-    def __init__(self, cfg: GridConfig) -> None:
-        self.cfg = cfg
+class Pi42Client:
+    def __init__(self, gcfg: GlobalConfig, scfg: SymbolConfig) -> None:
+        self.gcfg = gcfg
+        self.scfg = scfg
         self.session = requests.Session()
 
     def fetch_live_price(self) -> float:
-        endpoint = f"/v1/market/klines?priceType={self.cfg.kline_price_type}"
+        url = f"{PUBLIC_BASE_URL}/v1/market/klines?priceType={self.scfg.kline_price_type}"
         payload = {
-            "pair": self.cfg.symbol.upper(),
-            "interval": self.cfg.kline_interval,
-            "limit": self.cfg.kline_limit,
+            "pair": self.scfg.symbol,
+            "interval": self.scfg.kline_interval,
+            "limit": self.scfg.kline_limit,
         }
-
-        url = f"{PUBLIC_BASE_URL}{endpoint}"
         resp = self.session.post(url, json=payload, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-
-        candles: list[dict[str, Any]] = []
-        if isinstance(data, list):
-            candles = data
-        elif isinstance(data, dict) and isinstance(data.get("data"), list):
-            candles = data["data"]
-
+        candles: list = data if isinstance(data, list) else data.get("data", [])
         if not candles:
-            raise RuntimeError("No kline data returned")
-
+            raise RuntimeError(f"No kline data for {self.scfg.symbol}")
         close_raw = candles[-1].get("close") or candles[-1].get("c")
         return float(close_raw)
 
-    def place_webhook_market_order(self, side: str) -> dict[str, Any]:
+    def place_market_order(self, side: str) -> dict[str, Any]:
         payload = {
             "side": side.upper(),
             "type": "MARKET",
-            "uuid": self.cfg.webhook_uuid,
-            "action": self.cfg.webhook_action,
-            "symbol": self.cfg.symbol.upper(),
-            "quantity": self.cfg.quantity,
-            "marginAsset": self.cfg.margin_asset,
+            "uuid": self.gcfg.webhook_uuid,
+            "action": self.gcfg.webhook_action,
+            "symbol": self.scfg.symbol,
+            "quantity": self.scfg.quantity,
+            "marginAsset": self.scfg.margin_asset,
         }
-
-        resp = self.session.post(self.cfg.webhook_url, json=payload, timeout=20)
+        resp = self.session.post(self.gcfg.webhook_url, json=payload, timeout=20)
         resp.raise_for_status()
         if resp.text.strip():
             try:
@@ -298,219 +335,195 @@ class Pi42PublicWebhookClient:
 
 
 class GridBot:
-    def __init__(self, cfg: GridConfig, store: GridStore, client: Pi42PublicWebhookClient) -> None:
-        self.cfg = cfg
+    def __init__(self, gcfg: GlobalConfig, scfg: SymbolConfig, store: GridStore) -> None:
+        self.gcfg = gcfg
+        self.scfg = scfg
         self.store = store
-        self.client = client
+        self.client = Pi42Client(gcfg, scfg)
+        self.tag = f"[{scfg.symbol}]"
 
-    def _round_price(self, price: float) -> float:
-        return round(price, self.cfg.price_decimals)
+    def _round(self, price: float) -> float:
+        return round(price, self.scfg.price_decimals)
 
-    def _next_level_price(self, current_level_price: float) -> float:
-        return self._round_price(current_level_price * (1 - self.cfg.grid_step_pct / 100.0))
+    def _next_level(self, price: float) -> float:
+        return self._round(price * (1 - self.scfg.grid_step_pct / 100.0))
 
-    def _exit_price(self, last_buy_price: float) -> float:
-        return self._round_price(last_buy_price * (1 + self.cfg.exit_pct / 100.0))
+    def _exit_target(self, last_buy: float) -> float:
+        return self._round(last_buy * (1 + self.scfg.exit_pct / 100.0))
 
-    def _ensure_state(self) -> dict[str, Any]:
-        state = self.store.get_state()
+    def _ensure_state(self, live_price: float) -> dict[str, Any]:
+        state = self.store.get_state(self.scfg.symbol)
         if state:
             return state
-
-        anchor = self._round_price(self.cfg.grid_start_price)
-        self.store.init_state(symbol=self.cfg.symbol, anchor_price=anchor, step_pct=self.cfg.grid_step_pct)
-        return self.store.get_state() or {
-            "symbol": self.cfg.symbol.upper(),
-            "anchor_price": anchor,
-            "next_buy_price": anchor,
-            "step_pct": self.cfg.grid_step_pct,
-            "last_buy_price": None,
-            "levels_filled": 0,
-            "updated_at": utc_now_iso(),
-        }
-
-    def run_once(self) -> None:
-        state = self._ensure_state()
-        next_buy = float(state["next_buy_price"])
-        last_buy_price = state.get("last_buy_price")
-        levels_filled = int(state["levels_filled"])
-
-        live_price = self.client.fetch_live_price()
-        print(
-            f"[grid] live={live_price} next_buy={next_buy} "
-            f"levels_filled={levels_filled}"
+        anchor = self._round(
+            self.scfg.grid_start_price if self.scfg.grid_start_price > 0 else live_price
         )
+        print(f"{self.tag} initialising grid anchor={anchor}")
+        self.store.init_state(
+            symbol=self.scfg.symbol,
+            anchor_price=anchor,
+            step_pct=self.scfg.grid_step_pct,
+        )
+        return self.store.get_state(self.scfg.symbol)  # type: ignore[return-value]
 
-        if last_buy_price is not None:
-            exit_price = self._exit_price(float(last_buy_price))
-            print(f"[grid] last_buy={last_buy_price} exit_target={exit_price}")
-            if live_price >= exit_price:
-                if self.cfg.dry_run:
-                    response = {
-                        "dryRun": True,
-                        "message": "exit trigger hit",
-                        "symbol": self.cfg.symbol.upper(),
-                        "quantity": self.cfg.quantity,
-                        "price": exit_price,
-                    }
-                    self.store.save_order(
-                        symbol=self.cfg.symbol,
-                        side="SELL",
-                        order_type="MARKET",
-                        quantity=self.cfg.quantity,
-                        price=exit_price,
-                        level_index=levels_filled,
-                        status="DRY_RUN",
-                        response=response,
-                    )
-                    print("[trade] DRY_RUN exit logged; state unchanged")
-                    return
-
-                try:
-                    response = self.client.place_webhook_market_order("SELL")
-                    self.store.save_order(
-                        symbol=self.cfg.symbol,
-                        side="SELL",
-                        order_type="MARKET",
-                        quantity=self.cfg.quantity,
-                        price=exit_price,
-                        level_index=levels_filled,
-                        status="SUCCESS",
-                        response=response,
-                    )
-                    self.store.clear_last_buy_price()
-                    print("[trade] EXIT SUCCESS; cleared last_buy_price")
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    response = {"error": str(exc)}
-                    self.store.save_order(
-                        symbol=self.cfg.symbol,
-                        side="SELL",
-                        order_type="MARKET",
-                        quantity=self.cfg.quantity,
-                        price=exit_price,
-                        level_index=levels_filled,
-                        status="FAILED",
-                        response=response,
-                    )
-                    print(f"[trade] EXIT FAILED saved: {exc}")
-                    return
-
-        if live_price > next_buy:
-            print("[grid] no trigger yet")
-            return
-
-        if self.cfg.dry_run:
-            response = {
-                "dryRun": True,
-                "message": "price trigger hit",
-                "symbol": self.cfg.symbol.upper(),
-                "quantity": self.cfg.quantity,
-                "price": next_buy,
-            }
+    def _place(
+        self,
+        *,
+        side: str,
+        trigger_price: float,
+        levels_filled: int,
+        on_success: Callable,
+        label: str,
+    ) -> None:
+        if self.gcfg.dry_run:
             self.store.save_order(
-                symbol=self.cfg.symbol,
-                side="BUY",
+                symbol=self.scfg.symbol,
+                side=side,
                 order_type="MARKET",
-                quantity=self.cfg.quantity,
-                price=next_buy,
+                quantity=self.scfg.quantity,
+                price=trigger_price,
                 level_index=levels_filled,
                 status="DRY_RUN",
-                response=response,
+                response={"dryRun": True, "price": trigger_price},
             )
-            print("[trade] DRY_RUN buy logged; state unchanged")
+            print(f"{self.tag} DRY_RUN {label} @ {trigger_price}")
             return
 
         try:
-            response = self.client.place_webhook_market_order("BUY")
+            response = self.client.place_market_order(side)
             self.store.save_order(
-                symbol=self.cfg.symbol,
-                side="BUY",
+                symbol=self.scfg.symbol,
+                side=side,
                 order_type="MARKET",
-                quantity=self.cfg.quantity,
-                price=next_buy,
+                quantity=self.scfg.quantity,
+                price=trigger_price,
                 level_index=levels_filled,
                 status="SUCCESS",
                 response=response,
             )
-            new_next = self._next_level_price(next_buy)
-            self.store.advance_level(new_next)
-            self.store.set_last_buy_price(next_buy)
-            print(f"[trade] SUCCESS; advanced next_buy -> {new_next}")
+            on_success()
+            print(f"{self.tag} {label} SUCCESS @ {trigger_price}")
         except Exception as exc:  # noqa: BLE001
-            response = {"error": str(exc)}
             self.store.save_order(
-                symbol=self.cfg.symbol,
-                side="BUY",
+                symbol=self.scfg.symbol,
+                side=side,
                 order_type="MARKET",
-                quantity=self.cfg.quantity,
-                price=next_buy,
+                quantity=self.scfg.quantity,
+                price=trigger_price,
                 level_index=levels_filled,
                 status="FAILED",
-                response=response,
+                response={"error": str(exc)},
             )
-            print(f"[trade] FAILED saved: {exc}")
+            print(f"{self.tag} {label} FAILED: {exc}")
+
+    def run_once(self) -> None:
+        live_price = self.client.fetch_live_price()
+        state = self._ensure_state(live_price)
+        next_buy = float(state["next_buy_price"])
+        last_buy = state.get("last_buy_price")
+        levels_filled = int(state["levels_filled"])
+
+        print(f"{self.tag} live={live_price} next_buy={next_buy} levels={levels_filled}")
+
+        # EXIT check
+        if last_buy is not None:
+            exit_tgt = self._exit_target(float(last_buy))
+            print(f"{self.tag} last_buy={last_buy} exit_target={exit_tgt}")
+            if live_price >= exit_tgt:
+                self._place(
+                    side="SELL",
+                    trigger_price=exit_tgt,
+                    levels_filled=levels_filled,
+                    on_success=lambda: self.store.clear_last_buy_price(self.scfg.symbol),
+                    label="EXIT SELL",
+                )
+                return
+
+        # BUY check
+        if live_price <= next_buy:
+            def _on_buy() -> None:
+                new_next = self._next_level(next_buy)
+                self.store.advance_level(self.scfg.symbol, new_next)
+                self.store.set_last_buy_price(self.scfg.symbol, next_buy)
+                print(f"{self.tag} next_buy -> {new_next}")
+
+            self._place(
+                side="BUY",
+                trigger_price=next_buy,
+                levels_filled=levels_filled,
+                on_success=_on_buy,
+                label="BUY",
+            )
+        else:
+            print(f"{self.tag} no trigger")
 
     def run(self) -> None:
         print(
-            "[config] "
-            f"symbol={self.cfg.symbol.upper()} qty={self.cfg.quantity} "
-            f"start={self.cfg.grid_start_price} step={self.cfg.grid_step_pct}% exit={self.cfg.exit_pct}% "
-            f"poll={self.cfg.poll_seconds}s dry_run={self.cfg.dry_run} "
-            f"db={self.cfg.db_path}"
+            f"{self.tag} started | qty={self.scfg.quantity} "
+            f"step={self.scfg.grid_step_pct}% exit={self.scfg.exit_pct}% "
+            f"start={self.scfg.grid_start_price or 'live'} dry_run={self.gcfg.dry_run}"
         )
-
-        if self.cfg.run_mode == "once":
+        if self.gcfg.run_mode == "once":
             self.run_once()
             return
-
         while True:
             try:
                 self.run_once()
             except Exception as exc:  # noqa: BLE001
-                print(f"[loop] error: {exc}")
-            time.sleep(self.cfg.poll_seconds)
+                print(f"{self.tag} loop error: {exc}")
+            time.sleep(self.gcfg.poll_seconds)
 
 
 def main() -> int:
     load_env_file(".env")
-
-    cfg = GridConfig()
-    # Refresh config from environment after .env has been loaded.
-    cfg.webhook_url = os.getenv("PI42_WEBHOOK_URL", cfg.webhook_url)
-    cfg.webhook_uuid = os.getenv("PI42_WEBHOOK_UUID", cfg.webhook_uuid)
-    cfg.webhook_action = os.getenv("PI42_WEBHOOK_ACTION", cfg.webhook_action)
-    cfg.symbol = os.getenv("PI42_SYMBOL", cfg.symbol)
-    cfg.quantity = float(os.getenv("PI42_QTY", str(cfg.quantity)))
-    cfg.margin_asset = os.getenv("PI42_MARGIN_ASSET", cfg.margin_asset)
-    cfg.grid_start_price = float(os.getenv("PI42_GRID_START_PRICE", str(cfg.grid_start_price)))
-    cfg.grid_step_pct = float(os.getenv("PI42_GRID_STEP_PCT", str(cfg.grid_step_pct)))
-    cfg.exit_pct = float(os.getenv("PI42_EXIT_PCT", str(cfg.exit_pct)))
-    cfg.price_decimals = int(os.getenv("PI42_PRICE_DECIMALS", str(cfg.price_decimals)))
-    cfg.kline_interval = os.getenv("PI42_KLINE_INTERVAL", cfg.kline_interval)
-    cfg.kline_limit = int(os.getenv("PI42_KLINE_LIMIT", str(cfg.kline_limit)))
-    cfg.kline_price_type = os.getenv("PI42_KLINE_PRICE_TYPE", cfg.kline_price_type)
-    cfg.poll_seconds = int(os.getenv("PI42_POLL_SECONDS", str(cfg.poll_seconds)))
-    cfg.run_mode = os.getenv("PI42_RUN_MODE", cfg.run_mode)
-    cfg.dry_run = os.getenv("PI42_DRY_RUN", str(cfg.dry_run).lower()).lower() == "true"
-    cfg.db_path = os.getenv("PI42_GRID_DB", cfg.db_path)
+    gcfg = build_global_config()
 
     try:
-        cfg.validate()
+        gcfg.validate()
     except ValueError as exc:
         print(f"Configuration error: {exc}")
         return 1
 
-    store = GridStore(cfg.db_path)
-    client = Pi42PublicWebhookClient(cfg)
-    bot = GridBot(cfg, store, client)
+    print(
+        f"[main] symbols={gcfg.symbols} dry_run={gcfg.dry_run} "
+        f"poll={gcfg.poll_seconds}s db={gcfg.db_path}"
+    )
+
+    # Build one bot per symbol; each gets its own DB connection (WAL multi-writer safe)
+    bots = []
+    for sym in gcfg.symbols:
+        store = GridStore(gcfg.db_path)
+        scfg = build_symbol_config(sym)
+        bots.append(GridBot(gcfg, scfg, store))
+
+    # once-mode: run all symbols sequentially
+    if gcfg.run_mode == "once":
+        try:
+            for bot in bots:
+                bot.run_once()
+        except KeyboardInterrupt:
+            print("\n[main] stopped")
+        finally:
+            for bot in bots:
+                bot.store.close()
+        return 0
+
+    # forever-mode: one daemon thread per symbol, all run in parallel
+    threads = [
+        threading.Thread(target=bot.run, name=bot.scfg.symbol, daemon=True)
+        for bot in bots
+    ]
+    for t in threads:
+        t.start()
 
     try:
-        bot.run()
+        while any(t.is_alive() for t in threads):
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[bot] stopped")
+        print("\n[main] stopped")
     finally:
-        store.close()
+        for bot in bots:
+            bot.store.close()
 
     return 0
 
