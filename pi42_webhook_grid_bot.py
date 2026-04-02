@@ -106,7 +106,7 @@ class GridConfig:
     run_mode: str = os.getenv("PI42_RUN_MODE", "forever")
     dry_run: bool = os.getenv("PI42_DRY_RUN", "false").lower() == "true"
 
-    db_path: str = os.getenv("PI42_GRID_DB", "grid_bot.db")
+    db_path: str = os.getenv("PI42_GRID_DB", "/tmp/grid_bot.db")
 
     def validate(self) -> None:
         if not self.webhook_url:
@@ -129,6 +129,8 @@ class GridConfig:
 
 class GridStore:
     def __init__(self, db_path: str) -> None:
+        db_dir = os.path.dirname(os.path.abspath(db_path))
+        os.makedirs(db_dir, exist_ok=True)
         self.conn = sqlite3.connect(db_path)
         self.conn.executescript(SCHEMA_SQL)
         self._migrate_schema()
