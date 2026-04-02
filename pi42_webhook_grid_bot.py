@@ -84,8 +84,8 @@ def load_env_file(path: str = ".env") -> None:
 
 @dataclass
 class GridConfig:
-    webhook_url: Optional[str] = os.getenv("PI42_WEBHOOK_URL")
-    webhook_uuid: Optional[str] = os.getenv("PI42_WEBHOOK_UUID")
+    webhook_url: Optional[str] = os.getenv("PI42_WEBHOOK_URL", "https://webhooks.pi42.com/9420b64e63e7494c")
+    webhook_uuid: Optional[str] = os.getenv("PI42_WEBHOOK_UUID", "c2796a87be4300c32ea9a527c65f6233429da8ab1a2d1ea1373bc005ae1f5f39")
     webhook_action: str = os.getenv("PI42_WEBHOOK_ACTION", "NEW_ORDER")
 
     symbol: str = os.getenv("PI42_SYMBOL", "ETHINR")
@@ -93,7 +93,7 @@ class GridConfig:
     margin_asset: str = os.getenv("PI42_MARGIN_ASSET", "INR")
 
     # First grid anchor and grid spacing
-    grid_start_price: float = float(os.getenv("PI42_GRID_START_PRICE", "185000"))
+    grid_start_price: float = float(os.getenv("PI42_GRID_START_PRICE", "185010"))
     grid_step_pct: float = float(os.getenv("PI42_GRID_STEP_PCT", "1.0"))
     exit_pct: float = float(os.getenv("PI42_EXIT_PCT", "1.0"))
     price_decimals: int = int(os.getenv("PI42_PRICE_DECIMALS", "0"))
@@ -104,7 +104,7 @@ class GridConfig:
 
     poll_seconds: int = int(os.getenv("PI42_POLL_SECONDS", "15"))
     run_mode: str = os.getenv("PI42_RUN_MODE", "forever")
-    dry_run: bool = os.getenv("PI42_DRY_RUN", "true").lower() == "true"
+    dry_run: bool = os.getenv("PI42_DRY_RUN", "false").lower() == "true"
 
     db_path: str = os.getenv("PI42_GRID_DB", "grid_bot.db")
 
